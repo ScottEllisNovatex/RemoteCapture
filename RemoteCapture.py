@@ -7,7 +7,6 @@
 #
 # Use flask for the http interface, but use app.run() so we actually run the python file.
 
-
 import sys, os
 import flask
 import cv2
@@ -20,7 +19,6 @@ from twisted.internet.protocol import Protocol
 from twisted.internet import protocol
 from twisted.application import internet, service
 from twisted.internet import reactor
-
 
 # Init PIL to make sure it will not try to import plugin libraries
 # in a thread.
@@ -125,16 +123,17 @@ class RFBTest(rfb.RFBClient):
         # typicaly, here is the place to request the next screen update with FramebufferUpdateRequest(incremental=1).
         # argument is a list of tuples (x,y,w,h) with the updated rectangles.
     
-        # Just repeat the number of previous frames to get to the current time stamp, then add new frame.
-        # Use a frame rate of 10 per second? Does not need to be too fast!
-        # As long as the delay from VNC is reasonably consistent, we should get a good result.
-        # print(f"Commit Update")
+        # Every 100msec we should dump the screen image into a queue, so we dont hold this up, 
+        # and the main loop can write the queue to the video file.
+        # Would make opening and closing the video file simpler and cleaner. Try and avoid a memory copy...
+        # Need a timer to see if we have waited 100msec, or we got here sooner. Maybe the request rate - trigger update should be 2 x the fps.
+
         frame = np.array(self.screen)   # Convert PIL image to OpenCV image
         out.write(frame)    # Write the frame to the video file
 
         if (self.FirstTime):
             self.FirstTime = False
-            reactor.callLater(0.01, self.triggerupdate)    # 100msec, 10 per sec
+            reactor.callLater(0.1, self.triggerupdate)    # 100msec, 10 per sec
 
         return
 
@@ -142,7 +141,6 @@ class RFBTest(rfb.RFBClient):
         rfb.RFBClient.framebufferUpdateRequest(self,incremental=1)
         reactor.callLater(0.1, self.triggerupdate)
         return
-
 
 class RFBTestFactory(rfb.RFBFactory):
 
@@ -205,12 +203,11 @@ reactor.callLater(60, reactor.stop) # Only run for a minute - how we exit...
 
 
 SCREEN_SIZE = (1920, 1080) # Do this dynamically later
-fourcc = cv2.VideoWriter_fourcc(*"XVID")    # XVID, H264, HVEC
+fourcc = cv2.VideoWriter_fourcc(*"h264")    # XVID, H264 - needs openh264-1.8.0-win64.dll , HVEC
 fps = 10.0
 # create the video write object
 out = cv2.VideoWriter("output.mp4", fourcc, fps, (SCREEN_SIZE))
 
 reactor.run()        
 
-#cv2.destroyAllWindows()
 out.release()
