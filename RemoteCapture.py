@@ -8,7 +8,7 @@
 # Use flask for the http interface, but use app.run() so we actually run the python file.
 
 
-import sys, os, getopt
+import sys, os
 import flask
 import cv2
 import numpy as np
@@ -21,9 +21,6 @@ from twisted.internet import protocol
 from twisted.application import internet, service
 from twisted.internet import reactor
 
-
-    
-    
 
 # Init PIL to make sure it will not try to import plugin libraries
 # in a thread.
@@ -93,7 +90,7 @@ class RFBTest(rfb.RFBClient):
         self.screen.paste(self.cursor, (x, y), self.cmask)
 
     def updateRectangle(self, x, y, width, height, data):
-        print(f"Update Rectangle ({x},{y}), {width}, {height}, Data {repr(data[:20])} ")
+        # print(f"Update Rectangle ({x},{y}), {width}, {height} ")
         # ignore empty updates
         if not data:
             return
@@ -114,30 +111,38 @@ class RFBTest(rfb.RFBClient):
         else:
             self.screen.paste(update, (x, y))
 
-        self.drawCursor()
-        
-        if (self.FirstTime):
-            self.FirstTime = False
-            capture = self.screen
-            capture.save('Image.jpg')
-
+        self.drawCursor()       
+            
     def beginUpdate(self):
         # called before a series of updateRectangle(), copyRectangle() or fillRectangle().
         # Probably prevent trying to get a copy of the image to add to the video file at this point.
         # Unlock on the commitupdate. Otherwise likely to get wonky images.
-        print(f"Begin Update")
+        # print(f"Begin Update")
         return
 
     def commitUpdate(self, rectangles=None):
         # called after a series of updateRectangle(), copyRectangle() or fillRectangle() are finished.
         # typicaly, here is the place to request the next screen update with FramebufferUpdateRequest(incremental=1).
         # argument is a list of tuples (x,y,w,h) with the updated rectangles.
-
+    
         # Just repeat the number of previous frames to get to the current time stamp, then add new frame.
         # Use a frame rate of 10 per second? Does not need to be too fast!
         # As long as the delay from VNC is reasonably consistent, we should get a good result.
-        print(f"Commit Update")
+        # print(f"Commit Update")
+        frame = np.array(self.screen)   # Convert PIL image to OpenCV image
+        out.write(frame)    # Write the frame to the video file
+
+        if (self.FirstTime):
+            self.FirstTime = False
+            reactor.callLater(0.01, self.triggerupdate)    # 100msec, 10 per sec
+
         return
+
+    def triggerupdate(self):
+        rfb.RFBClient.framebufferUpdateRequest(self,incremental=1)
+        reactor.callLater(0.1, self.triggerupdate)
+        return
+
 
 class RFBTestFactory(rfb.RFBFactory):
 
@@ -146,7 +151,7 @@ class RFBTestFactory(rfb.RFBFactory):
         self.protocol = RFBTest
         self.password = password
         self.shared = shared
-
+        
     def clientConnectionLost(self, connector, reason):
         print(reason)
         try:
@@ -164,13 +169,9 @@ class RFBTestFactory(rfb.RFBFactory):
 
     def clientConnectionFailed(self, connector, reason):
         print("connection failed:", reason)
-        #from twisted.internet import reactor
         self.protocol.CloseFile()
         reactor.stop()
-        #self.deferred.errback(reason)
-
-    def clientConnectionMade(self, protocol):
-        self.deferred.callback(self.protocol)
+        
         
 def mainloop( dum=None):
     # gui 'mainloop', it is called repeated by twisteds mainloop by using callLater
@@ -191,7 +192,6 @@ def mainloop( dum=None):
     else:
         reactor.callLater(0.01, reactor.stop)
 
-
 log.startLogging(sys.stdout)
 
 application = service.Application("rfb test") # create Application
@@ -199,8 +199,18 @@ application = service.Application("rfb test") # create Application
 # connect to this host and port, and reconnect if we get disconnected
 vncClient = internet.TCPClient("localhost", 5900, RFBTestFactory(password="Hunter20")) # create the service
 vncClient.setServiceParent(application)
-
 vncClient.startService()
 reactor.callLater(0.2, mainloop)    # 200msec later..
 reactor.callLater(60, reactor.stop) # Only run for a minute - how we exit...
+
+
+SCREEN_SIZE = (1920, 1080) # Do this dynamically later
+fourcc = cv2.VideoWriter_fourcc(*"XVID")    # XVID, H264, HVEC
+fps = 10.0
+# create the video write object
+out = cv2.VideoWriter("output.mp4", fourcc, fps, (SCREEN_SIZE))
+
 reactor.run()        
+
+#cv2.destroyAllWindows()
+out.release()
