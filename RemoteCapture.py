@@ -5,28 +5,33 @@
 # Will have a Http interface to start and stop the captures and monitor the sessions
 # We want to Connect/Monitor/Disconnect to a server. Then Start and Stop a screen capture to video file
 #
-# Use flask for the http interface, but use app.run() so we actually run the python file.
 
 import sys, os
-import flask
 import cv2
 import numpy as np
 import rfb
+import threading
 import msvcrt  # Windows only!
 from PIL import Image
+from timeit import default_timer as timer
 from twisted.python import usage, log
-from twisted.internet.protocol import Protocol
-from twisted.internet import protocol
 from twisted.application import internet, service
-from twisted.internet import reactor
+from twisted.internet import reactor, protocol, endpoints
+from twisted.web import server, resource
 
 # Init PIL to make sure it will not try to import plugin libraries
 # in a thread.
 Image.preinit()
 Image.init()
+vncserver = 'localhost'
 
 class RFBTest(rfb.RFBClient):
-    """Test client"""
+    # Class static - we only allow one instance the way we are using it - 
+    # hacky, but pythons single threading means we want a single program instance per session recorder so as to spread the CPU load.
+    startrecordingflag = False
+    stoprecordingflag = False
+    recording = False
+    filename = "output.mp4"
 
     def vncConnectionMade(self):
         self.screen = None
@@ -34,13 +39,26 @@ class RFBTest(rfb.RFBClient):
         self.FirstTime = True
         self.image_mode = "RGBX"
 
+
         print("Screen format: depth=%d bytes_per_pixel=%r" % (self.depth, self.bpp))
         print("Desktop name: %r" % self.name)
         rfb.RFBClient.setEncodings(self,[rfb.RAW_ENCODING, rfb.COPY_RECTANGLE_ENCODING ])
         rfb.RFBClient.framebufferUpdateRequest(self)
 
+    def OpenFile(self, filename):
+        print(f"Opening the Video File for writing {filename}")
+        SCREEN_SIZE = (1920, 1080) # Do this dynamically later
+        fourcc = cv2.VideoWriter_fourcc(*"avc1")    # XVID, H264 - needs openh264-1.8.0-win64.dll , HVEC
+        fps = 10.0
+        # create the video write object
+        self.out = cv2.VideoWriter(filename, fourcc, fps, (SCREEN_SIZE))
+        self.recording = True
+        return
+
     def CloseFile(self):
         # Close off the recorded video file...
+        self.recording = False
+        self.out.release()
         print("Closed the Video File")
         return
 
@@ -128,16 +146,33 @@ class RFBTest(rfb.RFBClient):
         # Would make opening and closing the video file simpler and cleaner. Try and avoid a memory copy...
         # Need a timer to see if we have waited 100msec, or we got here sooner. Maybe the request rate - trigger update should be 2 x the fps.
 
-        frame = np.array(self.screen)   # Convert PIL image to OpenCV image
-        out.write(frame)    # Write the frame to the video file
+        
 
-        if (self.FirstTime):
-            self.FirstTime = False
-            reactor.callLater(0.1, self.triggerupdate)    # 100msec, 10 per sec
-
+        if (self.FirstTime):            
+            self.start = timer()
+            self.FirstTime = False     
+            reactor.callLater(0.1, self.triggerupdate)    # 100msec, 10 per sec (calls itself from that pont on..)       
+        else:
+            # Only write out the buffer every 100msec
+            end = timer()
+            if (end - self.start >= 0.1):
+                self.start += 0.1
+                # We may not always be capturing the session
+                if (self.recording == True):
+                    frame = np.array(self.screen)   # Convert PIL image to OpenCV image
+                    self.out.write(frame)    # Write the frame to the video file
         return
 
+    # Self calling function to run every 100msec.
     def triggerupdate(self):
+        if (self.startrecordingflag == True):   # Thread protection???
+            self.startrecordingflag = False
+            self.OpenFile(self.filename)
+
+        if (self.stoprecordingflag == True):   # Thread protection???
+            self.stoprecordingflag = False
+            self.CloseFile()
+
         rfb.RFBClient.framebufferUpdateRequest(self,incremental=1)
         reactor.callLater(0.1, self.triggerupdate)
         return
@@ -149,11 +184,13 @@ class RFBTestFactory(rfb.RFBFactory):
         self.protocol = RFBTest
         self.password = password
         self.shared = shared
-        
+
     def clientConnectionLost(self, connector, reason):
         print(reason)
         try:
-            reactor.stop()
+            self.protocol.CloseFile()
+            connector.connect()         # Try re-establishing the connection - depending on reason???
+
         except Exception as e:
             # woa, this means that something bad happened,
             # most probably we received a SIGINT. Now this is only
@@ -170,7 +207,6 @@ class RFBTestFactory(rfb.RFBFactory):
         self.protocol.CloseFile()
         reactor.stop()
         
-        
 def mainloop( dum=None):
     # gui 'mainloop', it is called repeated by twisteds mainloop by using callLater
     print("Main Loop")
@@ -182,9 +218,15 @@ def mainloop( dum=None):
         if (key == b'q'):
             print('Exiting')
             no_work = True
+        elif (key == b'S'):
+            print('Start Recording')
+            RFBTest.startrecordingflag = True
+        elif (key == b's'):
+            print('Stop Recording')
+            RFBTest.stoprecordingflag = True
         else:
-            print('You Pressed A Key! Hit q to exit')
-
+            print("Only valid keys are 'q', 'S'tart recording, 's'top recording")
+    
     if (not no_work):
         reactor.callLater(2, mainloop)
     else:
@@ -195,19 +237,45 @@ log.startLogging(sys.stdout)
 application = service.Application("rfb test") # create Application
 
 # connect to this host and port, and reconnect if we get disconnected
-vncClient = internet.TCPClient("localhost", 5900, RFBTestFactory(password="Hunter20")) # create the service
+vncClient = internet.TCPClient(vncserver, 5900, RFBTestFactory(password="Hunter20")) # create the service
 vncClient.setServiceParent(application)
 vncClient.startService()
+
+class Web(resource.Resource):
+    isLeaf = True
+    def render_GET(self, request):
+
+        if (request.path == b'/startrecord'):
+            filename = request.args.get(b'filename')
+            if (filename is not None):
+                RFBTest.filename = filename[0].decode('utf-8')
+                RFBTest.startrecordingflag = True
+                return f"<html>Start Recording to {RFBTest.filename}</html>".encode('utf-8')
+            else:
+                return f"<html>Start Recording Failed, missing filename parameter</html>".encode('utf-8')
+
+        if (request.path == b'/stoprecord'):
+            RFBTest.stoprecordingflag = True
+            RFBTest.filename = None
+            return "<html>Stopped Recording</html>".encode('utf-8')
+
+        if (request.path == b'/'):
+            return f"<html>Remote Capture (VNC) Server for VNC Client {vncserver}, Currently Recording: {RFBTest.recording}</html>".encode('utf-8')
+
+        return f"<html>Remote Capture (VNC) Server for VNC Client {vncserver}, Illegal Path {request.path}</html>".encode('utf-8')
+
+resource = Web()
+resource.putChild(b'startrecord', Web())
+resource.putChild(b'stoprecord', Web())
+site = server.Site(resource)
+endpoint = endpoints.TCP4ServerEndpoint(reactor, 5001)
+endpoint.listen(site)
+
 reactor.callLater(0.2, mainloop)    # 200msec later..
-reactor.callLater(60, reactor.stop) # Only run for a minute - how we exit...
+#reactor.callLater(60, reactor.stop) # Only run for a minute - how we exit...
+
+reactor.run()  
+
+print("Main Program Exit\n")    
 
 
-SCREEN_SIZE = (1920, 1080) # Do this dynamically later
-fourcc = cv2.VideoWriter_fourcc(*"h264")    # XVID, H264 - needs openh264-1.8.0-win64.dll , HVEC
-fps = 10.0
-# create the video write object
-out = cv2.VideoWriter("output.mp4", fourcc, fps, (SCREEN_SIZE))
-
-reactor.run()        
-
-out.release()
