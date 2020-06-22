@@ -10,7 +10,12 @@
             "request": "launch",
             "program": "${workspaceFolder}/RemoteCapture.py",
             "args": [
-                "--host=localhost"
+                "-vt",
+                "localhost",
+                "-hp",
+                "5001",
+                "-vf",
+                "c:/temp"
             ],
             "console": "integratedTerminal",
             "env": {

@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 import rfb
 import threading
+import argparse 
 import msvcrt  # Windows only!
 from PIL import Image
 from timeit import default_timer as timer
@@ -23,7 +24,8 @@ from twisted.web import server, resource
 # in a thread.
 Image.preinit()
 Image.init()
-vncserver = 'localhost'
+
+lasterror = "No Error"
 
 class RFBTest(rfb.RFBClient):
     # Class static - we only allow one instance the way we are using it - 
@@ -31,7 +33,8 @@ class RFBTest(rfb.RFBClient):
     startrecordingflag = False
     stoprecordingflag = False
     recording = False
-    filename = "output.mp4"
+    videofilename = "output.mp4"
+    videofolder = "."
 
     def vncConnectionMade(self):
         self.screen = None
@@ -39,25 +42,24 @@ class RFBTest(rfb.RFBClient):
         self.FirstTime = True
         self.image_mode = "RGBX"
 
-
         print("Screen format: depth=%d bytes_per_pixel=%r" % (self.depth, self.bpp))
         print("Desktop name: %r" % self.name)
         rfb.RFBClient.setEncodings(self,[rfb.RAW_ENCODING, rfb.COPY_RECTANGLE_ENCODING ])
         rfb.RFBClient.framebufferUpdateRequest(self)
 
-    def OpenFile(self, filename):
+    def OpenFile(self, filename):        
         print(f"Opening the Video File for writing {filename}")
         SCREEN_SIZE = (1920, 1080) # Do this dynamically later
         fourcc = cv2.VideoWriter_fourcc(*"avc1")    # XVID, H264 - needs openh264-1.8.0-win64.dll , HVEC
         fps = 10.0
         # create the video write object
         self.out = cv2.VideoWriter(filename, fourcc, fps, (SCREEN_SIZE))
-        self.recording = True
+        RFBTest.recording = True
         return
 
     def CloseFile(self):
         # Close off the recorded video file...
-        self.recording = False
+        RFBTest.recording = False
         self.out.release()
         print("Closed the Video File")
         return
@@ -165,12 +167,12 @@ class RFBTest(rfb.RFBClient):
 
     # Self calling function to run every 100msec.
     def triggerupdate(self):
-        if (self.startrecordingflag == True):   # Thread protection???
-            self.startrecordingflag = False
-            self.OpenFile(self.filename)
+        if (RFBTest.startrecordingflag == True):   # Thread protection???
+            RFBTest.startrecordingflag = False
+            self.OpenFile(os.path.join(RFBTest.videofolder, RFBTest.videofilename))
 
-        if (self.stoprecordingflag == True):   # Thread protection???
-            self.stoprecordingflag = False
+        if (RFBTest.stoprecordingflag == True):   # Thread protection???
+            RFBTest.stoprecordingflag = False
             self.CloseFile()
 
         rfb.RFBClient.framebufferUpdateRequest(self,incremental=1)
@@ -186,9 +188,10 @@ class RFBTestFactory(rfb.RFBFactory):
         self.shared = shared
 
     def clientConnectionLost(self, connector, reason):
-        print(reason)
+        lasterror = f"Connection lost: {reason}"
+        print(lasterror)
         try:
-            self.protocol.CloseFile()
+            self.protocol.CloseFile(self.protocol)
             connector.connect()         # Try re-establishing the connection - depending on reason???
 
         except Exception as e:
@@ -203,13 +206,14 @@ class RFBTestFactory(rfb.RFBFactory):
             pass             
 
     def clientConnectionFailed(self, connector, reason):
-        print("connection failed:", reason)
-        self.protocol.CloseFile()
+        lasterror = f"Connection failed: {reason}"
+        print(lasterror)
+        self.protocol.CloseFile(self.protocol)
         reactor.stop()
         
 def mainloop( dum=None):
     # gui 'mainloop', it is called repeated by twisteds mainloop by using callLater
-    print("Main Loop")
+    print(".",end='')
     no_work = False
 
     if msvcrt.kbhit():
@@ -232,12 +236,22 @@ def mainloop( dum=None):
     else:
         reactor.callLater(0.01, reactor.stop)
 
+# Start of Main
 log.startLogging(sys.stdout)
+
+parser = argparse.ArgumentParser() 
+parser.add_argument("-hp", dest='httpport', default=5001, type=int, help = "HTTP Listen Port")
+parser.add_argument("-vt", dest='vncserver', default='localhost', help = "VNC Target IP Address")
+parser.add_argument("-vf", dest='videofolder', default='v:\WS10', help = "Target Video Folder")
+parser.add_argument("-pwd", dest='password', default='Energy123', help = "VNC Password")
+args = parser.parse_args() 
+
+RFBTest.videofolder = args.videofolder
 
 application = service.Application("rfb test") # create Application
 
 # connect to this host and port, and reconnect if we get disconnected
-vncClient = internet.TCPClient(vncserver, 5900, RFBTestFactory(password="Hunter20")) # create the service
+vncClient = internet.TCPClient(args.vncserver, 5900, RFBTestFactory(password=args.password)) # create the service
 vncClient.setServiceParent(application)
 vncClient.startService()
 
@@ -248,27 +262,27 @@ class Web(resource.Resource):
         if (request.path == b'/startrecord'):
             filename = request.args.get(b'filename')
             if (filename is not None):
-                RFBTest.filename = filename[0].decode('utf-8')
+                RFBTest.videofilename = filename[0].decode('utf-8')
                 RFBTest.startrecordingflag = True
-                return f"<html>Start Recording to {RFBTest.filename}</html>".encode('utf-8')
+                return f"<html>Start Recording to {RFBTest.videofilename}</html>".encode('utf-8')
             else:
                 return f"<html>Start Recording Failed, missing filename parameter</html>".encode('utf-8')
 
         if (request.path == b'/stoprecord'):
             RFBTest.stoprecordingflag = True
-            RFBTest.filename = None
+            RFBTest.videofilename = None
             return "<html>Stopped Recording</html>".encode('utf-8')
 
         if (request.path == b'/'):
-            return f"<html>Remote Capture (VNC) Server for VNC Client {vncserver}, Currently Recording: {RFBTest.recording}</html>".encode('utf-8')
+            return f"<html>Remote Capture (VNC) Server for VNC Client {args.vncserver}, <br>Last Error: {lasterror}<br>Currently Recording: {RFBTest.recording}</html>".encode('utf-8')
 
-        return f"<html>Remote Capture (VNC) Server for VNC Client {vncserver}, Illegal Path {request.path}</html>".encode('utf-8')
+        return f"<html>Remote Capture (VNC) Server for VNC Client {args.vncserver}, Illegal Path {request.path}</html>".encode('utf-8')
 
 resource = Web()
 resource.putChild(b'startrecord', Web())
 resource.putChild(b'stoprecord', Web())
 site = server.Site(resource)
-endpoint = endpoints.TCP4ServerEndpoint(reactor, 5001)
+endpoint = endpoints.TCP4ServerEndpoint(reactor, args.httpport)
 endpoint.listen(site)
 
 reactor.callLater(0.2, mainloop)    # 200msec later..
